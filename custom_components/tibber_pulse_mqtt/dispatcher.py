@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 from homeassistant.core import HomeAssistant, callback
@@ -15,9 +16,18 @@ try:
 except Exception:
     pulse_pb2 = None
 
-from .parsers.pulse_envelope import pick_best_candidate_from_blob, decode_multi_chunk_stream, split_obis_frames
+from .parsers.pulse_envelope import (
+    pick_best_candidate_from_blob,
+    decode_multi_chunk_stream,
+    split_obis_frames,
+)
 from .parsers.obis_text import parse_obis_text
-from .parsers.dlms_cosem import parse_dlms, find_dlms_frame_in_blob
+from .parsers.dlms_cosem import (
+    parse_dlms,
+    find_dlms_frame_in_blob,
+    parse_dlms_frames_from_envelope,
+)
+from .parsers.dlms_datetime import resolve_frame_datetime
 
 from .obis.streaming import ObisStreamManager
 from .util.diagnostics import DiagnosticsRegistry
@@ -217,7 +227,21 @@ class TibberDispatcher:
         except Exception:
             pass
 
-        # 2) PROTOBUF ENVELOPE
+        # 2) PROTOBUF ENVELOPE WITH REPEATED HAN FRAMES
+        # Firmware 1.2.5 can publish several top-level field-2 blobs in one
+        # MQTT message. A proto3 singular `bytes blob` keeps only the last one,
+        # so inspect every top-level length-delimited field before that fallback.
+        decoded = parse_dlms_frames_from_envelope(payload)
+        for obis in decoded:
+            self.hass.loop.call_soon_threadsafe(self._apply_obis, dev_id, obis)
+        decoded_frames = len(decoded)
+        if decoded_frames:
+            self._diag.bump(dev_id, True, topic=topic, payload=payload, offset=None, had_blob=True)
+            if self.debug:
+                _LOGGER.debug("MULTI-FRAME DLMS decoded for %s: %d frames", dev_id, decoded_frames)
+            return
+
+        # 2.1) PROTOBUF ENVELOPE FALLBACK
         blob = None
         try:
             env = pulse_pb2.Envelope()
@@ -375,8 +399,12 @@ class TibberDispatcher:
         if not self._sensor_manager_ready():
             return
 
+        measurement_time = resolve_frame_datetime(
+            obis.get("_measurement_time"), self.hass.config.time_zone,
+            datetime.now(timezone.utc),
+        )
         for code, value in obis.items():
-            if code == "_units":
+            if code.startswith("_"):
                 continue
             if sm and hasattr(sm, "add_or_update"):
-                call_sm_on_loop(self.hass, sm.add_or_update, pulse_id, code, value, status)
+                call_sm_on_loop(self.hass, sm.add_or_update, pulse_id, code, value, status, measurement_time)
